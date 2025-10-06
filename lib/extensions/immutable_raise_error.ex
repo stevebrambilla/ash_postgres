@@ -26,18 +26,30 @@ defmodule AshPostgres.Extensions.ImmutableRaiseError do
   ```
   """
 
-  use AshPostgres.CustomExtension, name: "immutable_raise_error", latest_version: 1
+  use AshPostgres.CustomExtension, name: "immutable_raise_error", latest_version: 2
 
   require Ecto.Query
 
   @impl true
   def install(0) do
-    ash_raise_error_immutable()
+    """
+    #{ash_raise_error_immutable()}
+
+    #{ash_to_jsonb_immutable()}
+    """
+  end
+
+  def install(1) do
+    ash_to_jsonb_immutable()
   end
 
   @impl true
+  def uninstall(2) do
+    "execute(\"DROP FUNCTION IF EXISTS ash_to_jsonb_immutable(anyelement)\")"
+  end
+
   def uninstall(_version) do
-    "execute(\"DROP FUNCTION IF EXISTS ash_raise_error_immutable(jsonb, ANYCOMPATIBLE), ash_raise_error_immutable(jsonb, ANYELEMENT, ANYCOMPATIBLE)\")"
+    "execute(\"DROP FUNCTION IF EXISTS ash_to_jsonb_immutable(anyelement), ash_raise_error_immutable(jsonb, ANYCOMPATIBLE), ash_raise_error_immutable(jsonb, ANYELEMENT, ANYCOMPATIBLE)\")"
   end
 
   defp ash_raise_error_immutable do
@@ -74,60 +86,48 @@ defmodule AshPostgres.Extensions.ImmutableRaiseError do
     """
   end
 
+  # Wraps to_jsonb and pins session GUCs that affect JSON. This makes the function’s result
+  # deterministic, so it is safe to mark IMMUTABLE.
+  defp ash_to_jsonb_immutable do
+    """
+    execute(\"\"\"
+    CREATE OR REPLACE FUNCTION ash_to_jsonb_immutable(value anyelement)
+     RETURNS jsonb
+     LANGUAGE plpgsql
+     IMMUTABLE
+     SET search_path TO 'pg_catalog'
+     SET \"TimeZone\" TO 'UTC'
+     SET \"DateStyle\" TO 'ISO, YMD'
+     SET \"IntervalStyle\" TO 'iso_8601'
+     SET extra_float_digits TO '0'
+     SET bytea_output TO 'hex'
+    AS $function$
+    BEGIN
+      RETURN COALESCE(to_jsonb(value), 'null'::jsonb);
+    END;
+    $function$
+    \"\"\")
+    """
+  end
+
   @doc false
   def immutable_error_expr(
         query,
         %Ash.Query.Function.Error{arguments: [exception, input]} = value,
         bindings,
-        embedded?,
+        _embedded?,
         acc,
         type
       ) do
+    if !(Keyword.keyword?(input) or is_map(input)) do
+      raise "Input expression to `error` must be a map or keyword list"
+    end
+
     acc = %{acc | has_error?: true}
 
-    {encoded, acc} =
+    {error_payload, acc} =
       if Ash.Expr.expr?(input) do
-        frag_parts =
-          Enum.flat_map(input, fn {key, value} ->
-            if Ash.Expr.expr?(value) do
-              [
-                expr: to_string(key),
-                raw: "::text, ",
-                expr: value,
-                raw: ", "
-              ]
-            else
-              [
-                expr: to_string(key),
-                raw: "::text, ",
-                expr: value,
-                raw: "::jsonb, "
-              ]
-            end
-          end)
-
-        frag_parts =
-          List.update_at(frag_parts, -1, fn {:raw, text} ->
-            {:raw, String.trim_trailing(text, ", ") <> "))"}
-          end)
-
-        AshSql.Expr.dynamic_expr(
-          query,
-          %Ash.Query.Function.Fragment{
-            embedded?: false,
-            arguments:
-              [
-                raw: "jsonb_build_object('exception', ",
-                expr: inspect(exception),
-                raw: "::text, 'input', jsonb_build_object("
-              ] ++
-                frag_parts
-          },
-          bindings,
-          embedded?,
-          nil,
-          acc
-        )
+        expression_error_payload(exception, input, query, bindings, acc)
       else
         {Jason.encode!(%{exception: inspect(exception), input: Map.new(input)}), acc}
       end
@@ -159,7 +159,7 @@ defmodule AshPostgres.Extensions.ImmutableRaiseError do
       {nil, row_token} ->
         {:ok,
          Ecto.Query.dynamic(
-           fragment("ash_raise_error_immutable(?::jsonb, ?)", ^encoded, ^row_token)
+           fragment("ash_raise_error_immutable(?::jsonb, ?)", ^error_payload, ^row_token)
          ), acc}
 
       {dynamic_type, row_token} ->
@@ -167,12 +167,61 @@ defmodule AshPostgres.Extensions.ImmutableRaiseError do
          Ecto.Query.dynamic(
            fragment(
              "ash_raise_error_immutable(?::jsonb, ?, ?)",
-             ^encoded,
+             ^error_payload,
              ^dynamic_type,
              ^row_token
            )
          ), acc}
     end
+  end
+
+  # Encodes an error payload as jsonb without using any non-IMMUTABLE SQL functions.
+  #
+  # Strategy:
+  # * Split the 'input' into Ash expressions and literal values
+  # * Build the base json map with the exception name and literal input values
+  # * For each expression value, use nested IMMUTABLE calls to `jsonb_set` to write into the input,
+  #   converting each expression via `ash_to_jsonb_immutable` (which pins session GUCs for
+  #   deterministic encoding)
+  defp expression_error_payload(exception, input, query, bindings, acc) do
+    {expr_inputs, literal_inputs} =
+      Enum.split_with(input, fn {_key, value} -> Ash.Expr.expr?(value) end)
+
+    base_json = %{exception: inspect(exception), input: Map.new(literal_inputs)}
+
+    Enum.reduce(expr_inputs, {base_json, acc}, fn
+      {key, expr_value}, {current_payload, acc} ->
+        path_expr = %Ash.Query.Function.Type{
+          arguments: [["input", to_string(key)], {:array, :string}, []]
+        }
+
+        new_value_jsonb =
+          %Ash.Query.Function.Fragment{
+            arguments: [raw: "ash_to_jsonb_immutable(", expr: expr_value, raw: ")"]
+          }
+
+        {%Ecto.Query.DynamicExpr{} = new_payload, acc} =
+          AshSql.Expr.dynamic_expr(
+            query,
+            %Ash.Query.Function.Fragment{
+              arguments: [
+                raw: "jsonb_set(",
+                expr: current_payload,
+                raw: "::jsonb, ",
+                expr: path_expr,
+                raw: ", ",
+                expr: new_value_jsonb,
+                raw: "::jsonb, true)"
+              ]
+            },
+            bindings,
+            false,
+            nil,
+            acc
+          )
+
+        {new_payload, acc}
+    end)
   end
 
   # Returns a row-dependent token to prevent constant-folding for immutable functions.
